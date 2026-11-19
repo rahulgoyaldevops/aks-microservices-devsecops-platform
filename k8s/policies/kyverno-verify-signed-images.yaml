@@ -1,0 +1,38 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-acr-signed-images
+  annotations:
+    policies.kyverno.io/title: Verify Cosign OIDC Signatures for ACR Images
+    policies.kyverno.io/category: Software Supply Chain Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Requires all container images pulled from Azure Container Registry (*.azurecr.io/*)
+      to have a valid Cosign OIDC keyless signature issued by GitHub Actions before pods can start in AKS.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  webhookTimeoutSeconds: 30
+  failurePolicy: Fail
+  rules:
+    - name: verify-cosign-oidc-signature
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+      verifyImages:
+        - imageReferences:
+            - "*.azurecr.io/*"
+          verifyDigest: true
+          required: true
+          mutateDigest: true
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    issuer: "https://token.actions.githubusercontent.com"
+                    subjectRegExp: "https://github.com/rahulgoyaldevops/*"
+                    rekor:
+                      url: "https://rekor.sigstore.dev"
