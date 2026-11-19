@@ -1,0 +1,210 @@
+name: Progressive CD Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      service_name:
+        description: "Microservice name to deploy"
+        required: true
+        type: choice
+        options:
+          - frontend-dotnet
+          - backend-python
+      image_tag:
+        description: "Immutable image digest (@sha256:...) or tag"
+        required: true
+        type: string
+      promote_to_prod:
+        description: "Promote release to production after dev & uat"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ACR_NAME: ${{ vars.ACR_NAME || 'aksdevsecopsacr' }}
+  ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER || 'aksdevsecopsacr.azurecr.io' }}
+  AKS_RESOURCE_GROUP: ${{ vars.AKS_RESOURCE_GROUP || 'rg-aks-devsecops' }}
+  AKS_CLUSTER_NAME: ${{ vars.AKS_CLUSTER_NAME || 'aks-devsecops-cluster' }}
+
+jobs:
+  deploy-dev:
+    name: Deploy to Dev & DAST Scan
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure OIDC Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Verify ACR Image Signature with Cosign
+        run: |
+          IMAGE_REF="${{ env.ACR_LOGIN_SERVER }}/${{ inputs.service_name }}:${{ inputs.image_tag }}"
+          if [[ "${{ inputs.image_tag }}" == sha256:* ]]; then
+            IMAGE_REF="${{ env.ACR_LOGIN_SERVER }}/${{ inputs.service_name }}@${{ inputs.image_tag }}"
+          fi
+          cosign verify "$IMAGE_REF" \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/.*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
+
+      - name: Set AKS Context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ env.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ env.AKS_CLUSTER_NAME }}
+
+      - name: Helm Atomic Deploy to Dev
+        run: |
+          helm upgrade --install "${{ inputs.service_name }}" ./charts/microservice \
+            --namespace dev \
+            --create-namespace \
+            -f charts/microservice/values-dev.yaml \
+            --set image.repository="${{ env.ACR_LOGIN_SERVER }}/${{ inputs.service_name }}" \
+            --set image.tag="${{ inputs.image_tag }}" \
+            --atomic \
+            --wait \
+            --timeout 5m
+
+      - name: Smoke Test (/healthz)
+        run: |
+          kubectl -n dev rollout status deployment/"${{ inputs.service_name }}" --timeout=120s
+          SERVICE_URL="${{ vars.DEV_SERVICE_URL || 'http://localhost:8080' }}"
+          curl -fsS --retry 5 --retry-delay 5 "${SERVICE_URL}/healthz"
+
+      - name: OWASP ZAP DAST Baseline Scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: "${{ vars.DEV_SERVICE_URL || 'http://localhost:8080' }}"
+          fail_action: false
+
+  deploy-uat:
+    name: Deploy to UAT
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    environment: uat
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure OIDC Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Verify ACR Image Signature with Cosign
+        run: |
+          IMAGE_REF="${{ env.ACR_LOGIN_SERVER }}/${{ inputs.service_name }}:${{ inputs.image_tag }}"
+          if [[ "${{ inputs.image_tag }}" == sha256:* ]]; then
+            IMAGE_REF="${{ env.ACR_LOGIN_SERVER }}/${{ inputs.service_name }}@${{ inputs.image_tag }}"
+          fi
+          cosign verify "$IMAGE_REF" \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/.*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
+
+      - name: Set AKS Context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ env.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ env.AKS_CLUSTER_NAME }}
+
+      - name: Helm Atomic Deploy to UAT
+        run: |
+          helm upgrade --install "${{ inputs.service_name }}" ./charts/microservice \
+            --namespace uat \
+            --create-namespace \
+            -f charts/microservice/values-uat.yaml \
+            --set image.repository="${{ env.ACR_LOGIN_SERVER }}/${{ inputs.service_name }}" \
+            --set image.tag="${{ inputs.image_tag }}" \
+            --atomic \
+            --wait \
+            --timeout 5m
+
+      - name: Smoke Test (/healthz)
+        run: |
+          kubectl -n uat rollout status deployment/"${{ inputs.service_name }}" --timeout=120s
+          SERVICE_URL="${{ vars.UAT_SERVICE_URL || 'http://localhost:8080' }}"
+          curl -fsS --retry 5 --retry-delay 5 "${SERVICE_URL}/healthz"
+
+  deploy-prod:
+    name: Deploy to Production
+    needs: deploy-uat
+    if: ${{ inputs.promote_to_prod == true }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Azure OIDC Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Verify ACR Image Signature with Cosign
+        run: |
+          IMAGE_REF="${{ env.ACR_LOGIN_SERVER }}/${{ inputs.service_name }}:${{ inputs.image_tag }}"
+          if [[ "${{ inputs.image_tag }}" == sha256:* ]]; then
+            IMAGE_REF="${{ env.ACR_LOGIN_SERVER }}/${{ inputs.service_name }}@${{ inputs.image_tag }}"
+          fi
+          cosign verify "$IMAGE_REF" \
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/.*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com"
+
+      - name: Set AKS Context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ env.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ env.AKS_CLUSTER_NAME }}
+
+      - name: Record Pre-Deploy Helm Revision
+        id: pre_deploy
+        run: |
+          PREV_REV=$(helm history "${{ inputs.service_name }}" -n prod -o json | jq -r '.[-1].revision // "0"' 2>/dev/null || echo "0")
+          echo "prev_revision=${PREV_REV}" >> "$GITHUB_OUTPUT"
+
+      - name: Helm Atomic Deploy to Production
+        run: |
+          helm upgrade --install "${{ inputs.service_name }}" ./charts/microservice \
+            --namespace prod \
+            --create-namespace \
+            -f charts/microservice/values-prod.yaml \
+            --set image.repository="${{ env.ACR_LOGIN_SERVER }}/${{ inputs.service_name }}" \
+            --set image.tag="${{ inputs.image_tag }}" \
+            --atomic \
+            --wait \
+            --timeout 5m
+
+      - name: Post-Deploy Health Smoke Tests
+        id: smoke_test
+        run: |
+          kubectl -n prod rollout status deployment/"${{ inputs.service_name }}" --timeout=120s
+          SERVICE_URL="${{ vars.PROD_SERVICE_URL || 'http://localhost:8080' }}"
+          curl -fsS --retry 5 --retry-delay 5 "${SERVICE_URL}/healthz"
+
+      - name: Automated Helm Rollback on Verification Failure
+        if: failure() && steps.pre_deploy.outputs.prev_revision != '0'
+        run: |
+          echo "Post-deploy verification failed. Rolling back to revision ${{ steps.pre_deploy.outputs.prev_revision }}..."
+          helm rollback "${{ inputs.service_name }}" "${{ steps.pre_deploy.outputs.prev_revision }}" --namespace prod --wait
