@@ -1,0 +1,49 @@
+name: Microservices CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        default: "dev"
+        options:
+          - dev
+          - uat
+          - prod
+
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+  security-events: write
+
+jobs:
+  frontend-dotnet-ci:
+    name: "CI - frontend-dotnet"
+    uses: ./.github/workflows/reusable-service-ci.yml
+    with:
+      service_name: "frontend-dotnet"
+      language: "dotnet"
+      service_path: "src/frontend-dotnet"
+      environment: ${{ github.event.inputs.environment || 'dev' }}
+      push_to_acr: ${{ github.event_name != 'pull_request' }}
+    secrets: inherit
+
+  backend-python-ci:
+    name: "CI - backend-python"
+    uses: ./.github/workflows/reusable-service-ci.yml
+    with:
+      service_name: "backend-python"
+      language: "python"
+      service_path: "src/backend-python"
+      environment: ${{ github.event.inputs.environment || 'dev' }}
+      push_to_acr: ${{ github.event_name != 'pull_request' }}
+    secrets: inherit
