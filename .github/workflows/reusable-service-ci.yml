@@ -1,0 +1,230 @@
+name: Reusable Microservice DevSecOps CI
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        description: "Name of the microservice (e.g., frontend-dotnet, backend-python)"
+        required: true
+        type: string
+      language:
+        description: "Runtime language (dotnet or python)"
+        required: true
+        type: string
+      service_path:
+        description: "Path to the microservice directory"
+        required: true
+        type: string
+      environment:
+        description: "Target deployment environment (dev, uat, prod)"
+        required: false
+        type: string
+        default: "dev"
+      push_to_acr:
+        description: "Whether to push Docker image to ACR and sign with Cosign"
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      SONAR_TOKEN:
+        required: false
+      SONAR_HOST_URL:
+        required: false
+      SNYK_TOKEN:
+        required: false
+      BLACKDUCK_API_TOKEN:
+        required: false
+      BLACKDUCK_URL:
+        required: false
+      AZURE_CLIENT_ID:
+        required: false
+      AZURE_TENANT_ID:
+        required: false
+      AZURE_SUBSCRIPTION_ID:
+        required: false
+      ACR_LOGIN_SERVER:
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+  security-events: write
+
+jobs:
+  unit-tests-and-sast:
+    name: "Unit Tests & SAST (${{ inputs.service_name }})"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET 8 SDK
+        if: inputs.language == 'dotnet'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Run .NET Unit Tests
+        if: inputs.language == 'dotnet'
+        working-directory: ${{ inputs.service_path }}
+        run: |
+          if ls *.sln *.csproj 1> /dev/null 2>&1; then
+            dotnet restore
+            dotnet test --configuration Release --no-restore --verbosity normal
+          else
+            echo "No .NET project files found in ${{ inputs.service_path }} yet; skipping."
+          fi
+
+      - name: Setup Python 3.12
+        if: inputs.language == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Python Pytest Unit Tests
+        if: inputs.language == 'python'
+        working-directory: ${{ inputs.service_path }}
+        run: |
+          if [ -f requirements.txt ]; then
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt pytest
+            pytest -v
+          else
+            echo "No requirements.txt found in ${{ inputs.service_path }} yet; skipping."
+          fi
+
+      - name: Secret Scan - Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Secret Scan - TruffleHog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./${{ inputs.service_path }}
+          extra_args: --only-verified
+
+      - name: SAST - SonarQube Scan
+        if: ${{ secrets.SONAR_TOKEN != '' }}
+        uses: SonarSource/sonarqube-scan-action@v3
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          projectBaseDir: ${{ inputs.service_path }}
+
+      - name: SCA - Snyk Vulnerability Scan
+        if: ${{ secrets.SNYK_TOKEN != '' }}
+        uses: snyk/actions/setup@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: SCA - Run Snyk Test
+        if: ${{ secrets.SNYK_TOKEN != '' }}
+        working-directory: ${{ inputs.service_path }}
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk test --severity-threshold=high
+
+      - name: SCA - Black Duck Detect
+        if: ${{ secrets.BLACKDUCK_API_TOKEN != '' }}
+        uses: synopsys-sig/detect-action@v0.3.2
+        continue-on-error: true
+        env:
+          BLACKDUCK_URL: ${{ secrets.BLACKDUCK_URL }}
+          BLACKDUCK_API_TOKEN: ${{ secrets.BLACKDUCK_API_TOKEN }}
+        with:
+          scan-mode: RAPID
+          source-path: ${{ inputs.service_path }}
+
+      - name: Trivy Filesystem Vulnerability & Secret Scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: "fs"
+          scan-ref: "${{ inputs.service_path }}"
+          severity: "CRITICAL,HIGH"
+          exit-code: "0"
+
+  container-build-scan-sbom-sign:
+    name: "Build, Trivy Image, Syft SBOM & Cosign (${{ inputs.service_name }})"
+    needs: unit-tests-and-sast
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          IMAGE_TAG="${{ inputs.environment }}-${GITHUB_SHA::7}"
+          REGISTRY="${{ secrets.ACR_LOGIN_SERVER || 'ghcr.io/rahulgoyaldevops' }}"
+          IMAGE_NAME="${REGISTRY}/${{ inputs.service_name }}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "image_ref=${IMAGE_NAME}:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Azure OIDC Login & ACR Login
+        if: inputs.push_to_acr == true && secrets.AZURE_CLIENT_ID != ''
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to Azure Container Registry
+        if: inputs.push_to_acr == true && secrets.ACR_LOGIN_SERVER != ''
+        run: az acr login --name "${{ secrets.ACR_LOGIN_SERVER }}"
+
+      - name: Build Docker Image (and Push if enabled)
+        if: hashFiles(format('{0}/Dockerfile', inputs.service_path)) != ''
+        uses: docker/build-push-action@v6
+        id: build
+        with:
+          context: ${{ inputs.service_path }}
+          push: ${{ inputs.push_to_acr }}
+          load: ${{ !inputs.push_to_acr }}
+          tags: ${{ steps.meta.outputs.image_ref }}
+
+      - name: Trivy Container Image CVE Scan
+        if: hashFiles(format('{0}/Dockerfile', inputs.service_path)) != ''
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: "${{ steps.meta.outputs.image_ref }}"
+          format: "table"
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: "CRITICAL,HIGH"
+
+      - name: Generate CycloneDX SBOM with Syft
+        if: hashFiles(format('{0}/Dockerfile', inputs.service_path)) != ''
+        uses: anchore/sbom-action@v0.17.2
+        with:
+          image: "${{ steps.meta.outputs.image_ref }}"
+          format: "cyclonedx-json"
+          output-file: "${{ inputs.service_name }}-${{ inputs.environment }}-sbom.cdx.json"
+
+      - name: Upload CycloneDX SBOM Artifact
+        if: hashFiles(format('{0}/Dockerfile', inputs.service_path)) != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ inputs.service_name }}-${{ inputs.environment }}-cyclonedx-sbom"
+          path: "${{ inputs.service_name }}-${{ inputs.environment }}-sbom.cdx.json"
+          retention-days: 30
+
+      - name: Install Cosign
+        if: inputs.push_to_acr == true
+        uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Sign Container Image with Cosign (OIDC Keyless)
+        if: inputs.push_to_acr == true && hashFiles(format('{0}/Dockerfile', inputs.service_path)) != ''
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          cosign sign --yes "${{ steps.meta.outputs.image_ref }}@${{ steps.build.outputs.digest }}"
