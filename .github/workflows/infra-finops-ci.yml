@@ -84,7 +84,6 @@ jobs:
   infracost-finops:
     name: FinOps Cost Estimation (Infracost)
     runs-on: ubuntu-latest
-    if: ${{ secrets.INFRACOST_API_KEY != '' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -95,7 +94,10 @@ jobs:
           api-key: ${{ secrets.INFRACOST_API_KEY }}
 
       - name: Generate Infracost Cost Breakdown
+        env:
+          INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
         run: |
+          if [ -n "$INFRACOST_API_KEY" ]; then
           infracost breakdown \
             --path=${{ env.TF_WORKING_DIR }} \
             --terraform-var-file="environments/${{ env.TF_ENV }}.tfvars" \
@@ -105,7 +107,9 @@ jobs:
             --path=${{ env.TF_WORKING_DIR }} \
             --format=json \
             --out-file=/tmp/infracost.json
-
+          else
+            echo "Infracost skipped (set INFRACOST_API_KEY secret to enable)"
+          fi  
       - name: Post Infracost PR Comment
         if: github.event_name == 'pull_request'
         uses: infracost/actions/comment@v1
