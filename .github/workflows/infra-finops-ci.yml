@@ -1,0 +1,114 @@
+name: Infra & FinOps CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "infra/terraform/**"
+      - ".github/workflows/infra-finops-ci.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "infra/terraform/**"
+      - ".github/workflows/infra-finops-ci.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target Terraform environment"
+        required: true
+        type: choice
+        default: dev
+        options:
+          - dev
+          - uat
+          - prod
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+
+env:
+  TF_WORKING_DIR: infra/terraform
+  TF_ENV: ${{ inputs.environment || 'dev' }}
+
+jobs:
+  terraform-lint-and-security:
+    name: Terraform Lint & IaC Security
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+
+      - name: Terraform Format Check
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init & Validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+
+      - name: Init & Run TFLint
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          tflint --init
+          tflint --recursive
+
+      - name: Run tfsec IaC Security Scan
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: ${{ env.TF_WORKING_DIR }}
+          soft_fail: true
+
+      - name: Run Checkov IaC Security Scan
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ env.TF_WORKING_DIR }}
+          framework: terraform
+          soft_fail: true
+
+  infracost-finops:
+    name: FinOps Cost Estimation (Infracost)
+    runs-on: ubuntu-latest
+    if: ${{ secrets.INFRACOST_API_KEY != '' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Generate Infracost Cost Breakdown
+        run: |
+          infracost breakdown \
+            --path=${{ env.TF_WORKING_DIR }} \
+            --terraform-var-file="environments/${{ env.TF_ENV }}.tfvars" \
+            --format=json \
+            --out-file=/tmp/infracost.json || \
+          infracost breakdown \
+            --path=${{ env.TF_WORKING_DIR }} \
+            --format=json \
+            --out-file=/tmp/infracost.json
+
+      - name: Post Infracost PR Comment
+        if: github.event_name == 'pull_request'
+        uses: infracost/actions/comment@v1
+        with:
+          path: /tmp/infracost.json
+          behavior: update
