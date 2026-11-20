@@ -105,7 +105,7 @@ jobs:
           if [ -f requirements.txt ]; then
             python -m pip install --upgrade pip
             pip install -r requirements.txt pytest
-            pytest -v
+            PYTHONPATH=. pytest -v
           else
             echo "No requirements.txt found in ${{ inputs.service_path }} yet; skipping."
           fi
@@ -118,7 +118,7 @@ jobs:
       - name: Secret Scan - TruffleHog
         uses: trufflesecurity/trufflehog@main
         with:
-          path: ./${{ inputs.service_path }}
+          path: ./
           extra_args: --only-verified
 
       - name: SAST - SonarQube Scan
