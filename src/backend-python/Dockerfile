@@ -5,6 +5,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
 FROM python:3.12-slim AS runtime
+RUN apt-get update && apt-get upgrade -y --no-install-recommends && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system appgroup && useradd --system --gid appgroup --no-create-home appuser
 
