@@ -185,7 +185,6 @@ jobs:
           echo "has_blackduck=$([ -n "$BLACKDUCK_API_TOKEN" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           echo "has_azure=$([ -n "$AZURE_CLIENT_ID" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
           echo "has_acr=$([ -n "$ACR_LOGIN_SERVER" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-        uses: actions/checkout@v4
 
       - name: Set image metadata
         id: meta
