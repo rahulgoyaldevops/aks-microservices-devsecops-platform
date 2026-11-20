@@ -157,7 +157,7 @@ jobs:
           source-path: ${{ inputs.service_path }}
 
       - name: Trivy Filesystem Vulnerability & Secret Scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@master
         with:
           scan-type: "fs"
           scan-ref: "${{ inputs.service_path }}"
@@ -222,7 +222,7 @@ jobs:
 
       - name: Trivy Container Image CVE Scan
         if: hashFiles(format('{0}/Dockerfile', inputs.service_path)) != ''
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@master
         with:
           image-ref: "${{ steps.meta.outputs.image_ref }}"
           format: "table"
